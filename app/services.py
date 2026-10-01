@@ -8,7 +8,14 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
-from app.schemas import ManifestIn, PlanConfirmIn, ScheduleCreateIn, SlotDataIn
+from app.discharge import DischargeBox, InfeasibleDischarge, solve_discharge
+from app.schemas import (
+    DischargeCreateIn,
+    ManifestIn,
+    PlanConfirmIn,
+    ScheduleCreateIn,
+    SlotDataIn,
+)
 from app.scheduler import InfeasibleSchedule, Job, solve_loading
 from app.solver import (
     Container,
@@ -314,6 +321,12 @@ def confirm_plan(
                 "WHERE plan_id = ? AND status = 'current'",
                 (old_id,),
             )
+            # 旧修订的逐港卸箱顺序同样转为历史，仍可查询
+            cursor.execute(
+                "UPDATE discharge_plans SET status = 'historical' "
+                "WHERE plan_id = ? AND status = 'current'",
+                (old_id,),
+            )
 
         # 冲突预检：本方案占用槽位是否已被其他方案的确认占用
         conflict_slot = None
@@ -514,3 +527,204 @@ def utc_iso(dt) -> str | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).isoformat()
     return dt.astimezone(timezone.utc).isoformat()
+
+
+# ---------- 逐港卸箱顺序 ----------
+
+
+def _plan_material(db: Session, plan: models.Plan):
+    """取方案修订所基于的槽位资料与箱清单，构造箱号 -> (重量, 卸港) 与槽位资料。"""
+    slot_rev = db.scalar(
+        select(models.SlotRevision).where(
+            models.SlotRevision.revision == plan.slots_revision
+        )
+    )
+    manifest_rev = db.scalar(
+        select(models.ManifestRevision).where(
+            models.ManifestRevision.revision == plan.manifest_revision
+        )
+    )
+    if slot_rev is None:
+        raise BusinessError(
+            f"方案基于的槽位资料修订 {plan.slots_revision} 不存在", 500
+        )
+    if manifest_rev is None:
+        raise BusinessError(
+            f"方案基于的箱清单修订 {plan.manifest_revision} 不存在", 500
+        )
+    arm_by_slot = {s.code: s.arm for s in slot_rev.slots}
+    container_by_no = {c.no: c for c in manifest_rev.containers}
+    return slot_rev, manifest_rev, arm_by_slot, container_by_no
+
+
+def create_discharge_plan(
+    db: Session,
+    plan_id: str,
+    payload: DischargeCreateIn,
+) -> models.DischargePlan:
+    """为已确认方案修订求解并保存逐港卸箱顺序。
+
+    卸港序号与方案箱清单不一致、区间倒置、无可行顺序或求解无法确定均拒绝且不保存；
+    保存前在 IMMEDIATE 写锁内再次核对方案仍为已确认状态；
+    同一方案修订重复提交以新结果原子替换旧结果。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，仅已确认方案可规划逐港卸箱顺序"
+        )
+
+    slot_rev, manifest_rev, arm_by_slot, container_by_no = _plan_material(db, plan)
+
+    # 方案箱项与箱清单修订核对（理论一致，防御性校验，给出明确错误）
+    plan_nos = {i.container_no for i in plan.items}
+    missing_manifest = sorted(plan_nos - set(container_by_no))
+    if missing_manifest:
+        raise BusinessError(
+            f"方案箱 {', '.join(missing_manifest)} 在其所基于的箱清单修订 "
+            f"{plan.manifest_revision} 中不存在，拒绝规划卸箱顺序",
+            422,
+        )
+
+    # 卸港序号必须与方案箱清单中出现的卸港序号完全一致（不多不少）
+    plan_ports = {container_by_no[no].discharge_order for no in plan_nos}
+    submitted_ports = {p.discharge_order for p in payload.ports}
+    missing_ports = sorted(plan_ports - submitted_ports)
+    extra_ports = sorted(submitted_ports - plan_ports)
+    if missing_ports or extra_ports:
+        problems = []
+        if missing_ports:
+            problems.append(f"缺少卸港序号：{', '.join(map(str, missing_ports))}")
+        if extra_ports:
+            problems.append(f"多余卸港序号：{', '.join(map(str, extra_ports))}")
+        raise BusinessError(
+            "提交卸港序号与方案箱清单不一致（" + "；".join(problems) + "），拒绝规划",
+            422,
+        )
+
+    windows = {p.discharge_order: (p.min_moment, p.max_moment) for p in payload.ports}
+
+    boxes: list[DischargeBox] = []
+    for item in plan.items:
+        c = container_by_no[item.container_no]
+        arm = arm_by_slot.get(item.slot_code)
+        if arm is None:
+            raise BusinessError(
+                f"方案箱 {item.container_no} 所在槽位 {item.slot_code} 不在其所基于的"
+                f"槽位资料修订 {plan.slots_revision} 中，拒绝规划卸箱顺序",
+                500,
+            )
+        boxes.append(
+            DischargeBox(
+                no=item.container_no,
+                weight=c.weight,
+                arm=arm,
+                stack=item.stack,
+                tier=item.tier,
+                port=c.discharge_order,
+            )
+        )
+
+    try:
+        result = solve_discharge(boxes, windows)
+    except InfeasibleDischarge as exc:
+        # 已证无解 -> 422；求解器无法判定时同样拒绝且不保存，按冲突语义返回 409
+        if exc.undetermined:
+            raise ConflictError("求解无法确定：" + exc.reason) from exc
+        raise BusinessError("无解：" + exc.reason, 422) from exc
+
+    # 快照结果后结束只读事务，在独立连接写锁内复核方案状态后原子落库
+    snapshot_steps = tuple(
+        (s.step_no, s.discharge_order, s.container_no, s.remaining_moment)
+        for s in result.steps
+    )
+    snapshot_windows = tuple(
+        (o, windows[o][0], windows[o][1]) for o in sorted(windows)
+    )
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT status FROM plans WHERE id = ?", (plan_id,))
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在卸箱顺序保存期间被删除，本次规划被拒绝且不保存")
+        if row[0] != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案状态已为 {row[0]}（方案可能已被新修订取代），"
+                "本次卸箱顺序被拒绝且不保存"
+            )
+
+        # 同一方案修订重新提交：以新结果原子替换旧结果
+        cursor.execute("SELECT id FROM discharge_plans WHERE plan_id = ?", (plan_id,))
+        old = cursor.fetchone()
+        if old is not None:
+            old_id = old[0]
+            cursor.execute(
+                "DELETE FROM discharge_steps WHERE discharge_plan_id = ?", (old_id,)
+            )
+            cursor.execute(
+                "DELETE FROM discharge_windows WHERE discharge_plan_id = ?",
+                (old_id,),
+            )
+            cursor.execute("DELETE FROM discharge_plans WHERE id = ?", (old_id,))
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO discharge_plans (plan_id, status, created_at) "
+            "VALUES (?, 'current', ?)",
+            (plan_id, now),
+        )
+        dp_id = cursor.lastrowid
+        cursor.executemany(
+            "INSERT INTO discharge_windows "
+            "(discharge_plan_id, discharge_order, min_moment, max_moment) "
+            "VALUES (?, ?, ?, ?)",
+            [(dp_id, *w) for w in snapshot_windows],
+        )
+        cursor.executemany(
+            "INSERT INTO discharge_steps "
+            "(discharge_plan_id, step_no, discharge_order, container_no, "
+            "remaining_moment) VALUES (?, ?, ?, ?, ?)",
+            [(dp_id, *s) for s in snapshot_steps],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_discharge_plan(db, plan_id)
+
+
+def list_discharge_plans(
+    db: Session, include_historical: bool = False
+) -> list[models.DischargePlan]:
+    stmt = select(models.DischargePlan)
+    if not include_historical:
+        stmt = stmt.where(models.DischargePlan.status == "current")
+    stmt = stmt.order_by(models.DischargePlan.id)
+    return list(db.scalars(stmt))
+
+
+def get_discharge_plan(db: Session, plan_id: str) -> models.DischargePlan:
+    plan_row = db.get(models.Plan, plan_id)
+    if plan_row is None:
+        raise BusinessError(f"方案 {plan_id} 不存在", 404)
+    dp = db.scalar(
+        select(models.DischargePlan).where(
+            models.DischargePlan.plan_id == plan_id
+        )
+    )
+    if dp is None:
+        raise BusinessError(f"方案 {plan_id} 不存在逐港卸箱顺序", 404)
+    return dp

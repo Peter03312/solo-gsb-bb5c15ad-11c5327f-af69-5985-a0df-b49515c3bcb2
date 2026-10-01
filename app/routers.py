@@ -9,6 +9,10 @@ from app import services
 from app.database import get_db
 from app.schemas import (
     AssignmentOut,
+    DischargeCreateIn,
+    DischargeOut,
+    DischargePortOut,
+    DischargeStepOut,
     ManifestIn,
     ManifestRevisionOut,
     MessageOut,
@@ -244,3 +248,69 @@ def list_loading_schedules(
 )
 def get_loading_schedule(plan_id: str, db: Session = Depends(get_db)):
     return _schedule_out(services.get_loading_schedule(db, plan_id))
+
+
+# ---------- 逐港卸箱顺序 ----------
+
+
+def _discharge_out(d) -> DischargeOut:
+    return DischargeOut(
+        plan_id=d.plan_id,
+        revision_no=d.plan.revision_no,
+        status=d.status,
+        ports=[
+            DischargePortOut(
+                discharge_order=w.discharge_order,
+                min_moment=w.min_moment,
+                max_moment=w.max_moment,
+            )
+            for w in sorted(d.windows, key=lambda x: x.discharge_order)
+        ],
+        steps=[
+            DischargeStepOut(
+                step_no=s.step_no,
+                discharge_order=s.discharge_order,
+                container_no=s.container_no,
+                remaining_moment=s.remaining_moment,
+            )
+            for s in sorted(d.steps, key=lambda x: x.step_no)
+        ],
+        created_at=services.utc_iso(d.created_at),
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/discharge",
+    response_model=DischargeOut,
+    status_code=201,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="为已确认方案修订规划逐港卸箱顺序（全程箱号序列字典序最小）",
+)
+def create_discharge_plan(
+    plan_id: str, body: DischargeCreateIn, db: Session = Depends(get_db)
+):
+    plan = services.create_discharge_plan(db, plan_id, body)
+    return _discharge_out(plan)
+
+
+@router.get(
+    "/discharge-plans",
+    response_model=list[DischargeOut],
+    summary="列出逐港卸箱顺序（默认仅当前；historical=true 含历史）",
+)
+def list_discharge_plans(
+    historical: bool = False, db: Session = Depends(get_db)
+):
+    plans = services.list_discharge_plans(db, include_historical=historical)
+    return [_discharge_out(d) for d in plans]
+
+
+@router.get(
+    "/plans/{plan_id}/discharge",
+    response_model=DischargeOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询某方案修订绑定的逐港卸箱顺序（历史记录可查，含 status）",
+)
+def get_discharge_plan(plan_id: str, db: Session = Depends(get_db)):
+    return _discharge_out(services.get_discharge_plan(db, plan_id))

@@ -1,0 +1,6 @@
+{
+  "ports": [
+    {"discharge_order": 1, "min_moment": 0.0, "max_moment": 100000.0},
+    {"discharge_order": 2, "min_moment": 0.0, "max_moment": 100000.0}
+  ]
+}

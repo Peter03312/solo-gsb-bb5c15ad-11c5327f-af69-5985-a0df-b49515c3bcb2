@@ -267,3 +267,79 @@ class LoadingScheduleItem(Base):
         UniqueConstraint("schedule_id", "container_no",
                          name="uq_schedule_item_container"),
     )
+
+
+class DischargePlan(Base):
+    """绑定某个方案修订的逐港卸箱顺序。
+
+    只允许对已确认方案保存；方案修订被新修订取代（superseded）后，
+    其卸箱顺序仍可查询但状态转为 historical，不再列为当前卸箱顺序。
+    """
+
+    __tablename__ = "discharge_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # current=绑定方案仍为当前已确认修订；historical=方案修订已被取代
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="current")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    windows: Mapped[list["DischargeWindow"]] = relationship(
+        back_populates="plan_ref", cascade="all, delete-orphan"
+    )
+    steps: Mapped[list["DischargeStepRow"]] = relationship(
+        back_populates="plan_ref", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('current', 'historical')", name="ck_discharge_status"
+        ),
+    )
+
+
+class DischargeWindow(Base):
+    """卸箱计划中某卸港序号允许的剩余总力矩闭区间。"""
+
+    __tablename__ = "discharge_windows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    discharge_plan_id: Mapped[int] = mapped_column(
+        ForeignKey("discharge_plans.id", ondelete="CASCADE"), index=True
+    )
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    max_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    plan_ref: Mapped[DischargePlan] = relationship(back_populates="windows")
+
+    __table_args__ = (
+        UniqueConstraint("discharge_plan_id", "discharge_order",
+                         name="uq_window_port_in_plan"),
+        CheckConstraint("min_moment <= max_moment", name="ck_window_range"),
+    )
+
+
+class DischargeStepRow(Base):
+    """卸箱顺序中的一步：某卸港卸下某箱后的剩余总力矩。"""
+
+    __tablename__ = "discharge_steps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    discharge_plan_id: Mapped[int] = mapped_column(
+        ForeignKey("discharge_plans.id", ondelete="CASCADE"), index=True
+    )
+    step_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    plan_ref: Mapped[DischargePlan] = relationship(back_populates="steps")
+
+    __table_args__ = (
+        UniqueConstraint("discharge_plan_id", "step_no",
+                         name="uq_discharge_step_no"),
+    )

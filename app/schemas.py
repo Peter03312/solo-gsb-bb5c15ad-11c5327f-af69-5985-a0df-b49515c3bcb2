@@ -217,6 +217,62 @@ class ScheduleOut(BaseModel):
     created_at: str
 
 
+# ---------- 逐港卸箱顺序 ----------
+
+
+class DischargeWindowIn(BaseModel):
+    discharge_order: int = Field(..., ge=1, description="卸港序号，须与方案箱清单中出现的卸港序号完全一致")
+    min_moment: float = Field(..., description="该港允许剩余总力矩闭区间下限")
+    max_moment: float = Field(..., description="该港允许剩余总力矩闭区间上限")
+
+    @model_validator(mode="after")
+    def _window(self) -> "DischargeWindowIn":
+        if self.min_moment > self.max_moment:
+            raise ValueError(
+                f"卸港 {self.discharge_order} 的允许剩余总力矩区间下限 "
+                f"{self.min_moment} 不得高于上限 {self.max_moment}"
+            )
+        return self
+
+
+class DischargeCreateIn(BaseModel):
+    ports: list[DischargeWindowIn] = Field(
+        ..., description="每个卸港序号一条；空箱方案传空列表"
+    )
+
+    @model_validator(mode="after")
+    def _unique(self) -> "DischargeCreateIn":
+        orders = [p.discharge_order for p in self.ports]
+        if len(set(orders)) != len(orders):
+            dup = sorted({o for o in orders if orders.count(o) > 1})
+            raise ValueError(f"卸港序号重复：{', '.join(map(str, dup))}")
+        if orders != sorted(orders):
+            raise ValueError("卸港序号必须按从小到大给出")
+        return self
+
+
+class DischargeStepOut(BaseModel):
+    step_no: int
+    discharge_order: int
+    container_no: str
+    remaining_moment: float
+
+
+class DischargePortOut(BaseModel):
+    discharge_order: int
+    min_moment: float
+    max_moment: float
+
+
+class DischargeOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    status: str = Field(..., description="current=绑定方案仍为当前已确认修订；historical=方案修订已被取代")
+    ports: list[DischargePortOut]
+    steps: list[DischargeStepOut]
+    created_at: str
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str
