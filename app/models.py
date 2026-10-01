@@ -267,3 +267,86 @@ class LoadingScheduleItem(Base):
         UniqueConstraint("schedule_id", "container_no",
                          name="uq_schedule_item_container"),
     )
+
+
+class UnloadingSequence(Base):
+    """绑定某个方案修订的逐港卸箱顺序。
+
+    只允许对已确认方案保存；方案修订被新修订取代（superseded）后，
+    其卸箱顺序仍可查询但状态转为 historical，不再列为当前卸箱顺序。
+    """
+
+    __tablename__ = "unloading_sequences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    initial_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    final_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    # current=绑定方案仍为当前已确认修订；historical=方案修订已被取代
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="current")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    steps: Mapped[list["UnloadingStepRow"]] = relationship(
+        back_populates="sequence", cascade="all, delete-orphan"
+    )
+    ports: Mapped[list["UnloadingPortRow"]] = relationship(
+        back_populates="sequence", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('current', 'historical')", name="ck_unloading_status"
+        ),
+    )
+
+
+class UnloadingPortRow(Base):
+    """请求中各卸港序号的允许剩余总力矩闭区间（随顺序留档）。"""
+
+    __tablename__ = "unloading_ports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sequence_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_sequences.id", ondelete="CASCADE"), index=True
+    )
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    max_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    sequence: Mapped[UnloadingSequence] = relationship(back_populates="ports")
+
+    __table_args__ = (
+        UniqueConstraint("sequence_id", "discharge_order",
+                         name="uq_unloading_port_order"),
+    )
+
+
+class UnloadingStepRow(Base):
+    """卸箱顺序中的一步：港序、箱号与卸后剩余总力矩（含槽位快照）。"""
+
+    __tablename__ = "unloading_steps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sequence_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_sequences.id", ondelete="CASCADE"), index=True
+    )
+    step_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    slot_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight: Mapped[float] = mapped_column(Float, nullable=False)
+    arm: Mapped[float] = mapped_column(Float, nullable=False)
+    remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    sequence: Mapped[UnloadingSequence] = relationship(back_populates="steps")
+
+    __table_args__ = (
+        UniqueConstraint("sequence_id", "step_no", name="uq_unloading_step_no"),
+        UniqueConstraint("sequence_id", "container_no",
+                         name="uq_unloading_step_container"),
+    )

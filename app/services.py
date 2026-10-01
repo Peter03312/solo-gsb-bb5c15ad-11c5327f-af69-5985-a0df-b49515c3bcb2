@@ -8,13 +8,25 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
-from app.schemas import ManifestIn, PlanConfirmIn, ScheduleCreateIn, SlotDataIn
+from app.schemas import (
+    ManifestIn,
+    PlanConfirmIn,
+    ScheduleCreateIn,
+    SlotDataIn,
+    UnloadingCreateIn,
+)
 from app.scheduler import InfeasibleSchedule, Job, solve_loading
 from app.solver import (
     Container,
     InfeasibleStowage,
     Slot,
     solve_stowage,
+)
+from app.unloader import (
+    InfeasibleUnloading,
+    PlacedContainer,
+    PortWindow,
+    solve_unloading,
 )
 
 
@@ -314,6 +326,12 @@ def confirm_plan(
                 "WHERE plan_id = ? AND status = 'current'",
                 (old_id,),
             )
+            # 旧修订的逐港卸箱顺序同样保留可查，但不再列为当前顺序
+            cursor.execute(
+                "UPDATE unloading_sequences SET status = 'historical' "
+                "WHERE plan_id = ? AND status = 'current'",
+                (old_id,),
+            )
 
         # 冲突预检：本方案占用槽位是否已被其他方案的确认占用
         conflict_slot = None
@@ -506,6 +524,191 @@ def get_loading_schedule(db: Session, plan_id: str) -> models.LoadingSchedule:
     if schedule is None:
         raise BusinessError(f"方案 {plan_id} 不存在装船时间表", 404)
     return schedule
+
+
+# ---------- 逐港卸箱顺序 ----------
+
+
+def _placed_containers(db: Session, plan: models.Plan):
+    """按方案修订所用箱重（箱清单修订）与槽位力臂（槽位资料修订）组装箱快照。"""
+    manifest_rev = get_manifest_revision(db, plan.manifest_revision)
+    slot_rev = get_slot_revision(db, plan.slots_revision)
+    container_by_no = {c.no: c for c in manifest_rev.containers}
+    slot_by_code = {s.code: s for s in slot_rev.slots}
+
+    placed = []
+    for item in plan.items:
+        crow = container_by_no.get(item.container_no)
+        if crow is None:
+            raise BusinessError(
+                f"方案箱 {item.container_no} 在箱清单修订 "
+                f"{plan.manifest_revision} 中缺失，数据不一致", 500
+            )
+        srow = slot_by_code.get(item.slot_code)
+        if srow is None:
+            raise BusinessError(
+                f"方案槽位 {item.slot_code} 在槽位资料修订 "
+                f"{plan.slots_revision} 中缺失，数据不一致", 500
+            )
+        placed.append(
+            PlacedContainer(
+                no=item.container_no,
+                weight=crow.weight,
+                arm=srow.arm,
+                stack=item.stack,
+                tier=item.tier,
+                discharge_order=crow.discharge_order,
+            )
+        )
+    return placed
+
+
+def create_unloading_sequence(
+    db: Session,
+    plan_id: str,
+    payload: UnloadingCreateIn,
+) -> models.UnloadingSequence:
+    """为已确认方案修订求解并保存逐港卸箱顺序。
+
+    卸港序号与方案箱清单不一致、区间倒置、无可行顺序、求解无法确定均拒绝且不保存；
+    保存前在 IMMEDIATE 写锁内再次核对方案仍为已确认状态。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，仅已确认方案可规划逐港卸箱顺序"
+        )
+
+    boxes = _placed_containers(db, plan)
+    slot_by_item = {i.container_no: i.slot_code for i in plan.items}
+
+    windows = [
+        PortWindow(
+            discharge_order=p.discharge_order,
+            min_remaining_moment=p.min_remaining_moment,
+            max_remaining_moment=p.max_remaining_moment,
+        )
+        for p in payload.ports
+    ]
+
+    try:
+        result = solve_unloading(boxes, windows)
+    except InfeasibleUnloading as exc:
+        # 入参一致性问题、无可行顺序、求解无法确定均归 422 且不保存
+        raise BusinessError(f"无可行卸箱顺序：{exc.reason}", 422)
+
+    # 求解完成后快照结果，结束只读事务；在独立连接的写锁内复核方案状态后落库
+    step_rows = tuple(
+        (
+            st.step_no,
+            st.discharge_order,
+            st.container_no,
+            slot_by_item[st.container_no],
+            st.stack,
+            st.tier,
+            st.weight,
+            st.arm,
+            st.remaining_moment,
+        )
+        for st in result.steps
+    )
+    port_rows = tuple(
+        sorted(
+            ((w.discharge_order, w.min_remaining_moment, w.max_remaining_moment)
+             for w in windows),
+            key=lambda r: r[0],
+        )
+    )
+    initial_moment = result.initial_moment
+    final_moment = result.final_moment
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT status FROM plans WHERE id = ?", (plan_id,))
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在卸箱顺序保存期间被删除，顺序被拒绝且不保存")
+        if row[0] != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案状态已为 {row[0]}（方案可能已被新修订取代），"
+                "本次卸箱顺序被拒绝且不保存"
+            )
+
+        # 同一方案修订重新提交：以新顺序原子替换旧顺序
+        cursor.execute(
+            "SELECT id FROM unloading_sequences WHERE plan_id = ?", (plan_id,)
+        )
+        old = cursor.fetchone()
+        if old is not None:
+            cursor.execute(
+                "DELETE FROM unloading_steps WHERE sequence_id = ?", (old[0],)
+            )
+            cursor.execute(
+                "DELETE FROM unloading_ports WHERE sequence_id = ?", (old[0],)
+            )
+            cursor.execute(
+                "DELETE FROM unloading_sequences WHERE id = ?", (old[0],)
+            )
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO unloading_sequences "
+            "(plan_id, initial_moment, final_moment, status, created_at) "
+            "VALUES (?, ?, ?, 'current', ?)",
+            (plan_id, initial_moment, final_moment, now),
+        )
+        sequence_id = cursor.lastrowid
+        cursor.executemany(
+            "INSERT INTO unloading_ports "
+            "(sequence_id, discharge_order, min_remaining_moment, "
+            "max_remaining_moment) VALUES (?, ?, ?, ?)",
+            [(sequence_id, *row3) for row3 in port_rows],
+        )
+        cursor.executemany(
+            "INSERT INTO unloading_steps "
+            "(sequence_id, step_no, discharge_order, container_no, slot_code, "
+            "stack, tier, weight, arm, remaining_moment) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(sequence_id, *row9) for row9 in step_rows],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_unloading_sequence(db, plan_id)
+
+
+def list_unloading_sequences(
+    db: Session, include_historical: bool = False
+) -> list[models.UnloadingSequence]:
+    stmt = select(models.UnloadingSequence)
+    if not include_historical:
+        stmt = stmt.where(models.UnloadingSequence.status == "current")
+    stmt = stmt.order_by(models.UnloadingSequence.id)
+    return list(db.scalars(stmt))
+
+
+def get_unloading_sequence(db: Session, plan_id: str) -> models.UnloadingSequence:
+    sequence = db.scalar(
+        select(models.UnloadingSequence).where(
+            models.UnloadingSequence.plan_id == plan_id
+        )
+    )
+    if sequence is None:
+        raise BusinessError(f"方案 {plan_id} 不存在卸箱顺序", 404)
+    return sequence
 
 
 def utc_iso(dt) -> str | None:

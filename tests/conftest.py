@@ -42,6 +42,9 @@ def _clean_tables():
     try:
         db.query(models.LoadingScheduleItem).delete()
         db.query(models.LoadingSchedule).delete()
+        db.query(models.UnloadingStepRow).delete()
+        db.query(models.UnloadingPortRow).delete()
+        db.query(models.UnloadingSequence).delete()
         db.query(models.ConfirmedSlot).delete()
         db.query(models.PlanItem).delete()
         db.query(models.Plan).delete()

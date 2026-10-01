@@ -21,6 +21,10 @@ from app.schemas import (
     ScheduleOut,
     SlotDataIn,
     SlotRevisionOut,
+    UnloadingCreateIn,
+    UnloadingOut,
+    UnloadingPortOut,
+    UnloadingStepOut,
 )
 
 router = APIRouter()
@@ -244,3 +248,76 @@ def list_loading_schedules(
 )
 def get_loading_schedule(plan_id: str, db: Session = Depends(get_db)):
     return _schedule_out(services.get_loading_schedule(db, plan_id))
+
+
+# ---------- 逐港卸箱顺序 ----------
+
+
+def _unloading_out(u) -> UnloadingOut:
+    return UnloadingOut(
+        plan_id=u.plan_id,
+        revision_no=u.plan.revision_no,
+        status=u.status,
+        initial_moment=u.initial_moment,
+        final_moment=u.final_moment,
+        ports=[
+            UnloadingPortOut(
+                discharge_order=p.discharge_order,
+                min_remaining_moment=p.min_remaining_moment,
+                max_remaining_moment=p.max_remaining_moment,
+            )
+            for p in sorted(u.ports, key=lambda x: x.discharge_order)
+        ],
+        steps=[
+            UnloadingStepOut(
+                step_no=s.step_no,
+                discharge_order=s.discharge_order,
+                container_no=s.container_no,
+                slot_code=s.slot_code,
+                stack=s.stack,
+                tier=s.tier,
+                weight=s.weight,
+                arm=s.arm,
+                remaining_moment=s.remaining_moment,
+            )
+            for s in sorted(u.steps, key=lambda x: x.step_no)
+        ],
+        created_at=services.utc_iso(u.created_at),
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/unloading",
+    response_model=UnloadingOut,
+    status_code=201,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="为已确认方案修订规划逐港卸箱顺序（全程箱号序列字典序最小）",
+)
+def create_unloading_sequence(
+    plan_id: str, body: UnloadingCreateIn, db: Session = Depends(get_db)
+):
+    sequence = services.create_unloading_sequence(db, plan_id, body)
+    return _unloading_out(sequence)
+
+
+@router.get(
+    "/unloading",
+    response_model=list[UnloadingOut],
+    summary="列出逐港卸箱顺序（默认仅当前；historical=true 含历史顺序）",
+)
+def list_unloading_sequences(
+    historical: bool = False, db: Session = Depends(get_db)
+):
+    sequences = services.list_unloading_sequences(db, include_historical=historical)
+    return [_unloading_out(u) for u in sequences]
+
+
+@router.get(
+    "/plans/{plan_id}/unloading",
+    response_model=UnloadingOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询某方案修订绑定的逐港卸箱顺序（历史顺序可查，含 status）",
+)
+def get_unloading_sequence(plan_id: str, db: Session = Depends(get_db)):
+    return _unloading_out(services.get_unloading_sequence(db, plan_id))

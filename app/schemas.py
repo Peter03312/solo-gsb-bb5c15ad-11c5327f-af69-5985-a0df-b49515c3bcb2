@@ -217,6 +217,68 @@ class ScheduleOut(BaseModel):
     created_at: str
 
 
+# ---------- 逐港卸箱顺序 ----------
+
+
+class UnloadingPortIn(BaseModel):
+    discharge_order: int = Field(..., ge=1, description="卸港序号，须与方案箱清单完全一致")
+    min_remaining_moment: float = Field(..., description="该港允许剩余总力矩闭区间下限")
+    max_remaining_moment: float = Field(..., description="该港允许剩余总力矩闭区间上限")
+
+    @model_validator(mode="after")
+    def _window(self) -> "UnloadingPortIn":
+        if self.min_remaining_moment > self.max_remaining_moment:
+            raise ValueError(
+                f"卸港 {self.discharge_order} 的允许剩余总力矩下限 "
+                f"{self.min_remaining_moment} 不得高于上限 "
+                f"{self.max_remaining_moment}（区间倒置）"
+            )
+        return self
+
+
+class UnloadingCreateIn(BaseModel):
+    ports: list[UnloadingPortIn] = Field(
+        ..., description="每个卸港一条；卸港序号须与方案箱清单完全一致，不得重复"
+    )
+
+    @model_validator(mode="after")
+    def _unique(self) -> "UnloadingCreateIn":
+        orders = [p.discharge_order for p in self.ports]
+        if len(set(orders)) != len(orders):
+            dup = sorted({d for d in orders if orders.count(d) > 1})
+            raise ValueError(f"卸港序号重复提交：{', '.join(map(str, dup))}")
+        return self
+
+
+class UnloadingStepOut(BaseModel):
+    step_no: int
+    discharge_order: int
+    container_no: str
+    slot_code: str
+    stack: str
+    tier: int
+    weight: float
+    arm: float
+    remaining_moment: float
+
+
+class UnloadingPortOut(BaseModel):
+    discharge_order: int
+    min_remaining_moment: float
+    max_remaining_moment: float
+
+
+class UnloadingOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    status: str = Field(..., description="current=当前卸箱顺序；historical=方案修订已被取代")
+    initial_moment: float
+    final_moment: float
+    ports: list[UnloadingPortOut]
+    steps: list[UnloadingStepOut]
+    created_at: str
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str

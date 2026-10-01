@@ -2,7 +2,7 @@
 
 基于 Python + FastAPI + SQLAlchemy(SQLite) + PuLP(CBC 整数规划求解器) 实现的集装箱船配载方案核算 HTTP 服务。
 
-录入按**堆栈（stack）与层（tier）**编号的槽位、各槽承重、纵向力臂、相邻槽位关系与全船允许力矩区间，以及箱号、重量、危险类别、卸港先后与不相容危险类别对；服务输出**每箱槽位、总力矩与方案修订号**。方案确认后，还可按岸桥数量与每箱吊装时长/时间窗生成**每箱开工、完工分钟与岸桥编号的装船时间表**。
+录入按**堆栈（stack）与层（tier）**编号的槽位、各槽承重、纵向力臂、相邻槽位关系与全船允许力矩区间，以及箱号、重量、危险类别、卸港先后与不相容危险类别对；服务输出**每箱槽位、总力矩与方案修订号**。方案确认后，还可按岸桥数量与每箱吊装时长/时间窗生成**每箱开工、完工分钟与岸桥编号的装船时间表**，或按每个卸港的允许剩余总力矩闭区间生成**逐港卸箱顺序（各步港序、箱号与卸后剩余力矩）**。
 
 ## 一、配载约束（全部为硬性约束）
 
@@ -103,7 +103,86 @@ curl -s "$BASE/schedules?historical=true"
 curl -s $BASE/plans/<plan_id>/schedules
 ```
 
-## 五、启动
+## 五、逐港卸箱顺序
+
+方案**确认后**，按方案 ID 提交**每个卸港序号**的允许剩余总力矩闭区间，服务按该方案所用**箱重与槽位力臂**逐箱重算剩余总力矩，输出绑定该**方案修订**的逐港卸箱顺序。
+
+### 提交字段（`POST /api/plans/{plan_id}/unloading`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `ports[]` | 每个卸港一条；`discharge_order` 必须与该方案箱清单中的卸港序号**完全一致**（不得缺失、多余或重复），顺序可任意提交（服务内部按港序号升序处理） |
+| `ports[].discharge_order` | 卸港序号（正整数，小者先卸） |
+| `ports[].min_remaining_moment` | 该港允许剩余总力矩闭区间下限 |
+| `ports[].max_remaining_moment` | 该港允许剩余总力矩闭区间上限；下限不得高于上限 |
+
+### 卸箱硬约束
+
+1. **逐港**：按卸港序号从小到大，每个卸箱位置只允许卸下属于该港的箱（每港只卸该港箱）；
+2. **堆栈先后**：同堆栈上层箱未卸时不得取下下层箱（按配载方案已占用层自底向上的连续链）；
+3. **逐步剩余总力矩**：每卸一箱后，以该方案箱重与槽位力臂重算
+   `剩余总力矩 = 初始总力矩 − Σ已卸(箱重 × 纵向力臂)`，结果必须落入**该箱所属卸港**的允许闭区间；全部卸完后剩余力矩恒为 0（故末港区间必须包含 0）。
+
+### 优选规则
+
+在所有港口均可完成的卸箱顺序中，取**全程箱号序列字典序最小**者（港口顺序固定，仅在港内/各可行先后间择优）。求解采用整数规划（PuLP/CBC），分块基数编码与完整字典序最小严格等价；求解结果在服务内再以 Python 对全部硬约束逐步复核，不盲信求解器数值容差。
+
+### 保存与生命周期
+
+- 仅 `confirmed` 方案可规划卸箱顺序；`draft`/`superseded` 返回 `409`；
+- 卸港序号不一致、区间倒置、重复港序等入参问题返回 `422`；**无可行顺序或求解无法确定同样返回 `422` 且不保存**（中文说明原因，如末港区间不含 0、堆栈先后与某港区间不相交）；
+- **保存前在写锁内再次核对方案仍为已确认**：若求解期间方案被新修订确认取代，返回 `409` 且不保存；
+- 同一方案修订重复提交以新顺序**原子替换**旧顺序；
+- 方案修订被新修订确认取代（`superseded`）后，其卸箱顺序转为 **`historical`**：
+  仍可通过 `GET /api/plans/{plan_id}/unloading` 或 `GET /api/unloading?historical=true` 查询，
+  但不再列入默认的当前顺序；
+- 卸箱顺序与装船排程相互独立：历史顺序/排程仍可查询，**不影响已有配载与装船排程**；
+- **空箱方案**：提交 `ports: []`，返回空顺序、初始/最终力矩均为 0。
+
+### 响应示例
+
+```json
+{
+  "plan_id": "5c643ef7...",
+  "revision_no": 1,
+  "status": "current",
+  "initial_moment": -30.0,
+  "final_moment": 0.0,
+  "ports": [
+    {"discharge_order": 1, "min_remaining_moment": -100.0, "max_remaining_moment": -30.0},
+    {"discharge_order": 2, "min_remaining_moment": -100.0, "max_remaining_moment": 100.0}
+  ],
+  "steps": [
+    {"step_no": 1, "discharge_order": 1, "container_no": "C003",
+     "slot_code": "B01", "stack": "B", "tier": 1, "weight": 10.0, "arm": 5.0,
+     "remaining_moment": -80.0},
+    {"step_no": 2, "discharge_order": 1, "container_no": "C001",
+     "slot_code": "A02", "stack": "A", "tier": 2, "weight": 10.0, "arm": -2.0,
+     "remaining_moment": -60.0},
+    {"step_no": 3, "discharge_order": 2, "container_no": "C002",
+     "slot_code": "A01", "stack": "A", "tier": 1, "weight": 30.0, "arm": -2.0,
+     "remaining_moment": 0.0}
+  ],
+  "created_at": "..."
+}
+```
+
+curl 示例（请求体亦见 `examples/unloading.json`）：
+
+```bash
+# 方案确认后提交（422=序号不一致/区间倒置/无可行顺序且不保存；409=未确认或保存前已被取代）
+curl -s -X POST $BASE/plans/<plan_id>/unloading \
+  -H 'Content-Type: application/json' -d @examples/unloading.json
+
+# 查询当前卸箱顺序；加 ?historical=true 可同时查历史顺序
+curl -s "$BASE/unloading"
+curl -s "$BASE/unloading?historical=true"
+
+# 按方案修订查询其绑定卸箱顺序（历史顺序同样可查，status=historical）
+curl -s $BASE/plans/<plan_id>/unloading
+```
+
+## 六、启动
 
 ### 方式 A：Docker Compose（推荐，一键启动）
 
@@ -135,7 +214,7 @@ docker build -t stowage-service .
 docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 ```
 
-## 六、配置
+## 七、配置
 
 全部配置通过环境变量覆盖（前缀 `STOWAGE_`，也可用 `.env`）：
 
@@ -145,7 +224,7 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 | `STOWAGE_DATABASE_URL` | `sqlite:///./data/stowage.db` | SQLAlchemy 数据库地址；容器内固定 `sqlite:////app/data/stowage.db` |
 | `STOWAGE_API_PREFIX` | `/api` | API 路由前缀 |
 
-## 七、地址与端口
+## 八、地址与端口
 
 - 服务地址（本地）：`http://127.0.0.1:8000`
 - 健康检查：`GET http://127.0.0.1:8000/health`
@@ -153,7 +232,7 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 - 交互式文档（Swagger UI）：`http://127.0.0.1:8000/docs`
 - OpenAPI：`http://127.0.0.1:8000/openapi.json`
 
-## 八、HTTP API
+## 九、HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -167,6 +246,9 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 | POST | `/api/plans/{plan_id}/schedules` | 为**已确认方案修订**生成装船时间表（无解返回 422，不保存） |
 | GET | `/api/plans/{plan_id}/schedules` | 查询该方案修订绑定的装船时间表（历史排程可查） |
 | GET | `/api/schedules` | 列出装船时间表（默认仅当前；`?historical=true` 含历史） |
+| POST | `/api/plans/{plan_id}/unloading` | 为**已确认方案修订**规划逐港卸箱顺序（无可行顺序/无法确定返回 422，不保存） |
+| GET | `/api/plans/{plan_id}/unloading` | 查询该方案修订绑定的逐港卸箱顺序（历史顺序可查） |
+| GET | `/api/unloading` | 列出逐港卸箱顺序（默认仅当前；`?historical=true` 含历史） |
 | GET | `/api/plans` | 列出全部方案 |
 | GET | `/api/plans/{plan_id}` | 查询单个方案 |
 
@@ -196,11 +278,11 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 
 ### 错误处理
 
-- `400/404`：业务错误（修订/方案/排程不存在等），中文 `detail`；
-- `409 Conflict`：资料修订过期/不一致、重复确认、并发槽位占用冲突、对未确认方案排程或排程保存前方案已被新修订取代，原数据不变；
-- `422`：① 录入校验失败（非法重量、重复箱号、无效槽位、重复槽位编号、力矩区间倒置、排程箱项缺失/多余、岸桥数/时长非正、时间窗倒置等）；② 无完整可行方案或装船时间窗无解（**不保存**）。
+- `400/404`：业务错误（修订/方案/排程/卸箱顺序不存在等），中文 `detail`；
+- `409 Conflict`：资料修订过期/不一致、重复确认、并发槽位占用冲突、对未确认方案排程或规划卸箱顺序、排程/卸箱顺序保存前方案已被新修订取代，原数据不变；
+- `422`：① 录入校验失败（非法重量、重复箱号、无效槽位、重复槽位编号、力矩区间倒置、排程箱项缺失/多余、岸桥数/时长非正、时间窗倒置、卸港序号缺失/多余/重复、卸港区间倒置等）；② 无完整可行方案、装船时间窗无解或**无可行逐港卸箱顺序/求解无法确定**（均**不保存**）。
 
-## 九、请求示例（curl）
+## 十、请求示例（curl）
 
 ```bash
 BASE=http://127.0.0.1:8000/api
@@ -244,12 +326,19 @@ curl -s -X POST $BASE/plans/<plan_id>/amend \
 curl -s -X POST $BASE/plans/<plan_id>/schedules \
   -H 'Content-Type: application/json' -d @examples/schedule.json
 
-# 7) 查询
+# 7) 方案确认后规划逐港卸箱顺序（详见第五章；422=卸港序号不一致/区间倒置/无可行顺序且不保存）
+curl -s -X POST $BASE/plans/<plan_id>/unloading \
+  -H 'Content-Type: application/json' -d @examples/unloading.json
+
+# 8) 查询
 curl -s $BASE/plans
 curl -s $BASE/plans/<plan_id>
 curl -s "$BASE/schedules"                 # 当前排程
 curl -s "$BASE/schedules?historical=true" # 含历史排程
 curl -s $BASE/plans/<plan_id>/schedules   # 按方案修订查排程
+curl -s "$BASE/unloading"                 # 当前卸箱顺序
+curl -s "$BASE/unloading?historical=true" # 含历史卸箱顺序
+curl -s $BASE/plans/<plan_id>/unloading   # 按方案修订查卸箱顺序
 ```
 
 方案响应示例：
@@ -281,30 +370,31 @@ curl -s -X POST $BASE/slot-revisions    -H 'Content-Type: application/json' -d @
 curl -s -X POST $BASE/manifest-revisions -H 'Content-Type: application/json' -d @examples/containers.json
 ```
 
-## 十、测试
+## 十一、测试
 
 ```bash
 pip install pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程箱项一致性与历史标记、以及排程保存前的方案状态复核（47 个用例）。
+测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、逐港卸箱顺序求解器全部约束（逐港/堆栈先后/逐步力矩区间）与全程箱号字典序优选（含 200+ 随机案例穷举交叉验证）、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置/卸港序号不一致与区间倒置）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程与卸箱顺序的箱项一致性及历史标记、以及排程/卸箱顺序保存前的方案状态复核（68 个用例）。
 
-## 十一、目录结构
+## 十二、目录结构
 
 ```
 app/
   config.py      # 环境变量配置
   database.py    # 引擎/会话/建表，SQLite WAL、外键、busy_timeout
-  models.py      # ORM：资料修订、方案、方案项、已确认占用、装船排程及排程项
+  models.py      # ORM：资料修订、方案、方案项、已确认占用、装船排程、卸箱顺序等
   schemas.py     # Pydantic 模式与录入校验
   solver.py      # 配载 MILP 建模与两阶段优选（核心）
   scheduler.py   # 装船时间表（岸桥调度）MILP 与两阶段优选（核心）
-  services.py    # 业务逻辑、并发安全确认与排程保存前复核
+  unloader.py    # 逐港卸箱顺序 MILP、字典序优选与全约束 Python 复核（核心）
+  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序保存前复核
   routers.py     # HTTP 路由
   main.py        # FastAPI 入口
 scripts/entrypoint.sh  # 容器初始化入口
-tests/           # 单元/接口/并发测试（含调度器穷举交叉验证）
-examples/        # 请求示例（含 schedule.json）
+tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证）
+examples/        # 请求示例（含 schedule.json、unloading.json）
 Dockerfile / docker-compose.yml / requirements.txt
 ```
